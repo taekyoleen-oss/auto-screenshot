@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auto Screenshot</title>
+<meta name="description" content="선택한 창을 페이지 단위로 넘기며 자동으로 스크린샷을 찍어 폴더에 순서대로 저장하는 Windows 앱">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700;900&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #F7F8FA; --surface: #FFFFFF; --ink: #121826; --muted: #5B6476;
+    --line: #E3E6EC; --accent: #0B5394; --accent-ink: #FFFFFF; --soft: #E8F0FA;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0E1218; --surface: #161B23; --ink: #E8ECF2; --muted: #9AA4B5;
+      --line: #262D38; --accent: #5AA2E8; --accent-ink: #0E1218; --soft: #18263A;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0E1218; --surface: #161B23; --ink: #E8ECF2; --muted: #9AA4B5;
+    --line: #262D38; --accent: #5AA2E8; --accent-ink: #0E1218; --soft: #18263A;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: "Noto Sans KR", system-ui, sans-serif; line-height: 1.65; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 16px; }
+  header { padding: 72px 0 40px; }
+  .tag { display: inline-block; font-size: 13px; font-weight: 500; color: var(--accent); background: var(--soft); padding: 4px 12px; border-radius: 999px; }
+  h1 { font-size: clamp(34px, 6vw, 56px); font-weight: 900; line-height: 1.15; margin: 18px 0 16px; letter-spacing: -0.02em; }
+  .lead { font-size: 18px; color: var(--muted); max-width: 640px; margin: 0 0 28px; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 13px 22px; border-radius: 10px; font-weight: 700; text-decoration: none; font-size: 16px; }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); }
+  .btn.ghost { border: 1px solid var(--line); color: var(--ink); background: var(--surface); }
+  .note { font-size: 13px; color: var(--muted); }
+  .shot { margin: 8px 0 72px; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; background: var(--surface); box-shadow: 0 20px 50px -24px rgba(0,0,0,.35); }
+  .shot img { display: block; width: 100%; height: auto; }
+  h2 { font-size: 26px; font-weight: 800; margin: 0 0 20px; letter-spacing: -0.01em; }
+  section { margin-bottom: 72px; }
+  .loop { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; counter-reset: s; }
+  .step { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px; position: relative; }
+  .step::before { counter-increment: s; content: counter(s); display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: var(--accent-ink); font-weight: 700; font-size: 14px; margin-bottom: 10px; }
+  .step b { display: block; margin-bottom: 4px; }
+  .step p { margin: 0; color: var(--muted); font-size: 14px; }
+  .why { margin-top: 16px; padding: 16px 18px; border-left: 3px solid var(--accent); background: var(--soft); border-radius: 0 10px 10px 0; font-size: 15px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  .card b { display: block; margin-bottom: 4px; }
+  .card p { margin: 0; color: var(--muted); font-size: 14px; }
+  table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; font-size: 15px; }
+  th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  th { font-weight: 700; color: var(--muted); font-size: 13px; }
+  tr:last-child td { border-bottom: 0; }
+  .table-wrap { overflow-x: auto; }
+  ol.use { padding-left: 20px; margin: 0; }
+  ol.use li { margin-bottom: 8px; }
+  code { font-family: ui-monospace, Consolas, monospace; font-size: .92em; background: var(--soft); padding: 1px 6px; border-radius: 5px; }
+  footer { border-top: 1px solid var(--line); padding: 28px 0 40px; color: var(--muted); font-size: 14px; }
+  footer a { color: var(--accent); }
+  @media (max-width: 760px) {
+    header { padding: 48px 0 28px; }
+    .loop, .grid { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 460px) { .loop, .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="tag">Windows 데스크톱 앱 · 무료</span>
+    <h1>긴 문서와 터미널을<br>페이지마다 자동으로 캡처</h1>
+    <p class="lead">캡처할 창을 고르고 시작만 누르세요. Page Down으로 화면을 넘기며 끝까지 스크린샷을 찍고, 새 폴더에 <code>0001.png</code>부터 순서대로 저장합니다.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/taekyoleen-oss/auto-screenshot/releases/latest/download/AutoScreenshot.exe">⬇ AutoScreenshot.exe 다운로드</a>
+      <a class="btn ghost" href="https://github.com/taekyoleen-oss/auto-screenshot">GitHub 소스 보기</a>
+    </div>
+    <p class="note">Windows 10 / 11 · 설치 없이 바로 실행 · 처음 실행 시 SmartScreen 경고가 뜨면 “추가 정보 → 실행”을 누르세요.</p>
+  </header>
+
+  <div class="shot"><img src="app.png" alt="Auto Screenshot 앱 화면: 캡처할 창 목록, 캡처 설정, 저장 위치" width="1202" height="1008"></div>
+
+  <section>
+    <h2>동작 방식 — 마우스 클릭 전환</h2>
+    <div class="loop">
+      <div class="step"><b>대상 창 클릭</b><p>마우스가 선택한 창으로 이동해 클릭하고 활성화합니다.</p></div>
+      <div class="step"><b>페이지 넘기기</b><p>Page Down(또는 Space, 방향키, 휠)으로 다음 화면으로 이동합니다.</p></div>
+      <div class="step"><b>이 앱으로 복귀</b><p>마우스가 작은 캡처 패널로 돌아와 클릭해 이 앱을 활성화합니다.</p></div>
+      <div class="step"><b>캡처·저장</b><p>패널을 잠깐 투명하게 한 뒤 찍어 번호 순서대로 저장합니다.</p></div>
+    </div>
+    <p class="why">대상 창이 <b>비활성 상태</b>에서 찍히므로 글자 커서와 마우스 포인터가 이미지에 남지 않습니다. 대상 앱이 활성 상태일 때만 캡처를 막는 경우에도 캡처할 수 있습니다.</p>
+  </section>
+
+  <section>
+    <h2>기능</h2>
+    <div class="grid">
+      <div class="card"><b>끝 자동 감지</b><p>화면이 더 이상 바뀌지 않으면 문서 끝으로 보고 스스로 멈춥니다.</p></div>
+      <div class="card"><b>선택한 창만</b><p>목록에서 고른 창에 대해서만 클릭·키 입력·캡처를 합니다.</p></div>
+      <div class="card"><b>안전 정지</b><p>다른 창이 끼어들면 즉시 멈춥니다. Esc로 언제든 중지할 수 있습니다.</p></div>
+      <div class="card"><b>클릭 위치 지정</b><p>링크나 버튼이 없는 빈 곳을 한 번 클릭해 클릭 지점으로 정합니다.</p></div>
+      <div class="card"><b>캡처 영역 선택</b><p>창 영역만, 그 창이 있는 모니터 전체, 모든 모니터 중에서 고릅니다.</p></div>
+      <div class="card"><b>PNG · JPG · PDF</b><p>이미지로 저장하고, 원하면 한 개의 PDF로도 합칩니다.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>대상별 권장 설정</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>대상</th><th>시작 위치</th><th>페이지 이동 방식</th></tr></thead>
+        <tbody>
+          <tr><td>메모장 · Word · VS Code</td><td>Ctrl+Home</td><td>Page Down</td></tr>
+          <tr><td>Windows Terminal · PowerShell</td><td>Ctrl+Shift+Home</td><td>Shift+Page Down</td></tr>
+          <tr><td>웹 브라우저 · PDF 뷰어</td><td>현재 위치 또는 Ctrl+Home</td><td>Page Down 또는 Space</td></tr>
+          <tr><td>키 입력이 안 먹는 앱</td><td>현재 위치</td><td>마우스 휠</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>사용 방법</h2>
+    <ol class="use">
+      <li>캡처할 파일이나 터미널을 먼저 열어 둡니다.</li>
+      <li>앱의 <b>① 캡처할 창 선택</b> 목록에서 그 창을 고릅니다.</li>
+      <li>필요하면 <b>📍 지정</b>으로 대상 창의 클릭 위치를 정합니다. 기본값은 창 중앙입니다.</li>
+      <li><b>▶ 캡처 시작</b>을 누르고, 진행 중에는 마우스를 건드리지 않습니다.</li>
+      <li>끝나면 <b>📂 저장 폴더 열기</b>로 결과를 확인합니다.</li>
+    </ol>
+  </section>
+</div>
+
+<footer>
+  <div class="wrap">
+    운영체제 수준의 캡처 차단(Display Affinity, DRM 영상 등)이 걸린 화면은 검게 찍히며, 이를 우회하지 않습니다.<br>
+    소스 코드와 문의: <a href="https://github.com/taekyoleen-oss/auto-screenshot">github.com/taekyoleen-oss/auto-screenshot</a>
+  </div>
+</footer>
+</body>
+</html>
