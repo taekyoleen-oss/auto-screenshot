@@ -1,14 +1,17 @@
 """
-Auto Screenshot - 선택한 창을 페이지 단위로 스크롤하며 자동 캡처하는 Windows 앱
+Auto Screenshot - 화면을 페이지 단위로 넘기며 전체 화면을 자동 캡처하는 Windows 앱
 
-동작 방식 (마우스 클릭 전환 모드, 기본)
+기본 동작 (설정 없이 [캡처 시작]만 누르면)
   매 페이지마다
-    1) 마우스가 대상 창의 클릭 위치로 이동해 클릭 → 대상 창 활성화
-    2) Page Down 등 페이지 이동 키 전송
+    1) 마우스가 화면 가운데로 이동해 클릭 → 그 자리의 앱(원격 데스크톱·터미널 등) 활성화
+    2) Page Down 전송
     3) 마우스가 이 앱의 캡처 패널로 돌아와 클릭 → 이 앱 활성화
-    4) 이 앱이 활성화된 상태에서 캡처 (패널은 캡처 순간 투명 처리)
-  → 대상 창이 포커스를 잃은 상태에서 찍으므로 글자 커서(캐럿)와 마우스 포인터가
-    캡처에 포함되지 않고, 대상 앱이 활성 상태일 때만 동작하는 캡처 방지도 피할 수 있습니다.
+    4) 이 앱이 활성화된 상태에서 전체 화면 캡처 (패널은 캡처 순간 투명 처리)
+  → 대상 앱이 비활성 상태에서 찍히므로 글자 커서·마우스 포인터가 남지 않고,
+    대상 앱이 활성 상태일 때만 걸리는 캡처 제한을 피할 수 있습니다.
+  화면이 더 이상 바뀌지 않으면 자동 정지. Esc 또는 마우스를 직접 움직이면 즉시 중지.
+
+필요할 때만 [⚙ 설정 변경]에서 클릭 위치, 특정 창, 캡처 영역, 이동 방식 등을 바꿉니다.
 
 의존성: Python 3.9+, Pillow (tkinter 는 표준 포함)
 """
@@ -42,7 +45,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageChops, ImageGrab
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # ──────────────────────────────────────────────────────────────
 # Win32 헬퍼
@@ -58,6 +61,9 @@ user32.WindowFromPoint.restype = wt.HWND
 user32.WindowFromPoint.argtypes = [wt.POINT]
 user32.MonitorFromWindow.restype = wt.HANDLE
 user32.MonitorFromWindow.argtypes = [wt.HWND, wt.DWORD]
+user32.MonitorFromPoint.restype = wt.HANDLE
+user32.MonitorFromPoint.argtypes = [wt.POINT, wt.DWORD]
+user32.GetMonitorInfoW.argtypes = [wt.HANDLE, ctypes.c_void_p]
 user32.SetLayeredWindowAttributes.argtypes = [wt.HWND, wt.DWORD, ctypes.c_ubyte, wt.DWORD]
 kernel32.OpenProcess.restype = wt.HANDLE
 kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
@@ -74,6 +80,7 @@ WS_EX_TOOLWINDOW = 0x80
 SW_RESTORE = 9
 GA_ROOT = 2
 LWA_ALPHA = 2
+MONITOR_DEFAULTTONEAREST = 2
 
 VK_LBUTTON = 0x01
 VK_SHIFT, VK_CONTROL = 0x10, 0x11
@@ -83,6 +90,11 @@ EXTENDED_KEYS = {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E}
 KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP = 0x1, 0x2
 MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP = 0x0002, 0x0004
 MOUSEEVENTF_WHEEL = 0x0800
+
+# 바탕화면·작업표시줄 (화면 가운데에 앱이 없을 때 감지용)
+SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+
+MOUSE_MOVE_STOP_PX = 40  # 사용자가 마우스를 이만큼 움직이면 중지
 
 
 class MONITORINFO(ctypes.Structure):
@@ -106,6 +118,19 @@ def _process_name(hwnd):
         kernel32.CloseHandle(h)
 
 
+def window_title(hwnd):
+    n = user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(n + 1)
+    user32.GetWindowTextW(hwnd, buf, n + 1)
+    return buf.value
+
+
+def class_name(hwnd):
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buf, 256)
+    return buf.value
+
+
 def list_windows(exclude_pid=None):
     """화면에 보이는 최상위 창 목록 [(hwnd, 제목, 프로세스명)]"""
     result = []
@@ -113,8 +138,7 @@ def list_windows(exclude_pid=None):
     def callback(hwnd, _):
         if not user32.IsWindowVisible(hwnd):
             return True
-        length = user32.GetWindowTextLengthW(hwnd)
-        if length == 0:
+        if user32.GetWindowTextLengthW(hwnd) == 0:
             return True
         if user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW:
             return True
@@ -127,11 +151,10 @@ def list_windows(exclude_pid=None):
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if pid.value == exclude_pid:
                 return True
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        if buf.value in ("Program Manager",):
+        title = window_title(hwnd)
+        if title == "Program Manager":
             return True
-        result.append((hwnd, buf.value, _process_name(hwnd)))
+        result.append((hwnd, title, _process_name(hwnd)))
         return True
 
     user32.EnumWindows(EnumWindowsProc(callback), 0)
@@ -150,8 +173,11 @@ def window_rect(hwnd):
     return r.left, r.top, r.right, r.bottom
 
 
-def _monitor_info(hwnd):
-    hmon = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+def _rect(r):
+    return r.left, r.top, r.right, r.bottom
+
+
+def _monitor_info(hmon):
     mi = MONITORINFO()
     mi.cbSize = ctypes.sizeof(MONITORINFO)
     user32.GetMonitorInfoW(hmon, ctypes.byref(mi))
@@ -159,13 +185,17 @@ def _monitor_info(hwnd):
 
 
 def monitor_rect(hwnd):
-    r = _monitor_info(hwnd).rcMonitor
-    return r.left, r.top, r.right, r.bottom
+    return _rect(_monitor_info(user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)).rcMonitor)
 
 
-def monitor_work_rect(hwnd):
-    r = _monitor_info(hwnd).rcWork
-    return r.left, r.top, r.right, r.bottom
+def monitor_at(x, y, work=False):
+    mi = _monitor_info(user32.MonitorFromPoint(wt.POINT(int(x), int(y)), MONITOR_DEFAULTTONEAREST))
+    return _rect(mi.rcWork if work else mi.rcMonitor)
+
+
+def primary_center():
+    """주 모니터의 가운데 좌표"""
+    return user32.GetSystemMetrics(0) // 2, user32.GetSystemMetrics(1) // 2
 
 
 def root_of(hwnd):
@@ -187,7 +217,7 @@ def window_at(x, y):
 
 
 def activate_window(hwnd):
-    """대상 창을 맨 앞으로 가져오고 성공 여부 반환 (키 입력 모드용)"""
+    """창을 맨 앞으로 가져오고 성공 여부 반환"""
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, SW_RESTORE)
     fg = user32.GetForegroundWindow()
@@ -256,23 +286,27 @@ def point_in(rect, x, y):
 
 
 def click_point(hwnd, ratio):
-    """창 영역 기준 비율 (fx, fy) → 화면 좌표. ratio 가 None 이면 창 중앙"""
+    """창 영역 기준 비율 (fx, fy) → 화면 좌표. ratio 가 None 이면 창 가운데"""
     l, t, r, b = window_rect(hwnd)
     fx, fy = ratio or (0.5, 0.5)
     return l + (r - l) * fx, t + (b - t) * fy
 
 
 # ──────────────────────────────────────────────────────────────
-# 캡처 로직
+# 옵션
 # ──────────────────────────────────────────────────────────────
-MODE_CLICK = "마우스 클릭 전환 (권장)"
+TARGET_SCREEN = "화면 가운데 앱 (원격·터미널 포함)"
+TARGET_WINDOW = "목록에서 창 선택"
+TARGETS = [TARGET_SCREEN, TARGET_WINDOW]
+
+MODE_CLICK = "마우스 클릭 전환 (캡처 제한 회피)"
 MODE_KEY = "키 입력만 (빠름)"
 MODES = [MODE_CLICK, MODE_KEY]
 
-AREA_WINDOW = "선택한 창 영역"
-AREA_MONITOR = "창이 있는 모니터 전체"
+AREA_SCREEN = "전체 화면"
+AREA_WINDOW = "대상 창 영역만"
 AREA_ALL = "모든 모니터"
-AREAS = [AREA_WINDOW, AREA_MONITOR, AREA_ALL]
+AREAS = [AREA_SCREEN, AREA_WINDOW, AREA_ALL]
 
 START_OPTIONS = {
     "현재 위치에서 시작": None,
@@ -289,20 +323,12 @@ SCROLL_OPTIONS = {
 }
 
 
-def capture_bbox(hwnd, area):
-    if area == AREA_WINDOW:
-        return window_rect(hwnd)
-    if area == AREA_MONITOR:
-        return monitor_rect(hwnd)
-    return None  # 모든 모니터
-
-
 def grab(bbox):
     return ImageGrab.grab(bbox=bbox, all_screens=True).convert("RGB")
 
 
 def images_same(a, b, threshold=0.002):
-    """두 캡처가 사실상 같은지 (깜빡이는 커서 등 미세 변화는 무시)"""
+    """두 캡처가 사실상 같은지 (깜빡이는 커서·시계 등 미세 변화는 무시)"""
     if a is None or b is None or a.size != b.size:
         return False
     w, h = a.size
@@ -317,63 +343,122 @@ def safe_name(text, limit=40):
     return (name[:limit].strip(" ._") or "capture")
 
 
-class CaptureJob(threading.Thread):
-    """백그라운드에서 (대상 클릭 → 페이지 이동 → 앱 복귀 → 캡처)를 반복"""
+# ──────────────────────────────────────────────────────────────
+# 캡처 작업
+# ──────────────────────────────────────────────────────────────
+class Stopped(Exception):
+    pass
 
-    def __init__(self, hwnd, cfg, out_dir, events, panel_hwnd, click_ratio=None):
+
+class CaptureJob(threading.Thread):
+    """백그라운드에서 (대상 클릭 → 페이지 이동 → 앱 복귀 → 캡처)를 반복
+
+    target_hwnd 가 None 이면 '화면 모드': 클릭 위치(기본: 주 모니터 가운데)에 있는 앱이
+    첫 클릭 때 대상으로 정해진다.
+    """
+
+    def __init__(self, cfg, out_dir, events, panel_hwnd, target_hwnd=None, click_ratio=None, click_abs=None):
         super().__init__(daemon=True)
-        self.hwnd, self.cfg, self.out_dir, self.events = hwnd, cfg, out_dir, events
+        self.cfg, self.out_dir, self.events = cfg, out_dir, events
         self.panel_hwnd = panel_hwnd
+        self.hwnd = target_hwnd
+        self.window_mode = target_hwnd is not None
         self.click_ratio = click_ratio
+        self.click_abs = tuple(click_abs) if click_abs else None
         self.click_mode = cfg["mode"] == MODE_CLICK
         self.stop_flag = threading.Event()
+        self.stop_reason = "사용자 중지"
+        self.last_cursor = None
         self.saved = []
 
     def emit(self, kind, **data):
         self.events.put((kind, data))
 
-    def wait(self, seconds):
-        """대기하면서 Esc / 중지 버튼 감시. 중지되면 True"""
-        end = time.time() + seconds
-        while time.time() < end:
-            if self.stop_flag.is_set() or esc_pressed():
-                self.stop_flag.set()
-                return True
-            time.sleep(0.03)
-        return self.stop_flag.is_set()
+    # ── 중지 감시 (Esc / 중지 버튼 / 마우스 직접 움직임) ──
+    def mark_cursor(self):
+        self.last_cursor = cursor_pos()
+
+    def should_stop(self):
+        if self.stop_flag.is_set():
+            return True
+        if esc_pressed():
+            self.stop_reason = "사용자 중지 (Esc)"
+        elif self.last_cursor is not None:
+            x, y = cursor_pos()
+            lx, ly = self.last_cursor
+            if abs(x - lx) > MOUSE_MOVE_STOP_PX or abs(y - ly) > MOUSE_MOVE_STOP_PX:
+                self.stop_reason = "마우스 움직임을 감지해 중지"
+            else:
+                return False
+        else:
+            return False
+        self.stop_flag.set()
+        return True
 
     def check_stop(self):
-        if self.stop_flag.is_set() or esc_pressed():
-            raise InterruptedError
+        if self.should_stop():
+            raise Stopped
+
+    def wait(self, seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            self.check_stop()
+            time.sleep(0.03)
+
+    # ── 좌표·영역 ──
+    def point(self):
+        if self.window_mode:
+            return click_point(self.hwnd, self.click_ratio)
+        return self.click_abs or primary_center()
+
+    def capture_bbox(self):
+        area = self.cfg["area"]
+        if area == AREA_WINDOW:
+            return window_rect(self.hwnd)
+        if area == AREA_ALL:
+            return None
+        # 전체 화면: 대상 창(또는 클릭 위치)이 있는 모니터
+        return monitor_rect(self.hwnd) if self.window_mode else monitor_at(*self.point())
 
     # ── 포커스 전환 ──
     def focus_target(self):
-        """대상 창을 활성화 (클릭 모드: 마우스로 클릭)"""
-        if not self.click_mode:
-            if foreground_root() == self.hwnd or activate_window(self.hwnd):
-                return
-            raise RuntimeError("대상 창이 앞에 있지 않아 중지했습니다(다른 창이 활성화됨).")
-        if user32.IsIconic(self.hwnd):
+        """클릭 위치의 앱을 활성화 (클릭 모드: 마우스로 클릭)"""
+        if self.window_mode and user32.IsIconic(self.hwnd):
             user32.ShowWindow(self.hwnd, SW_RESTORE)
             time.sleep(0.3)
-        x, y = click_point(self.hwnd, self.click_ratio)
-        if window_at(x, y) != self.hwnd:
-            # 다른 창에 가려져 있으면 한 번 앞으로 가져온 뒤 다시 확인
+        x, y = self.point()
+        under = window_at(x, y)
+
+        if self.hwnd is None:  # 화면 모드: 첫 클릭 때 대상 결정
+            if not under or under == self.panel_hwnd or class_name(under) in SHELL_CLASSES:
+                raise RuntimeError("클릭 위치(화면 가운데)에 앱 창이 없습니다. 캡처할 앱을 화면 가운데에 띄우거나 "
+                                   "[⚙ 설정 변경]에서 클릭 위치를 지정하세요.")
+            self.hwnd = under
+            self.emit("target", title=window_title(under) or class_name(under))
+        elif under != self.hwnd:
+            if self.window_mode:
+                activate_window(self.hwnd)
+                under = window_at(x, y)
+            if under != self.hwnd:
+                raise RuntimeError("클릭 위치를 다른 창이 가리고 있어 중지했습니다.")
+
+        if self.click_mode:
+            click_at(x, y)
+            self.mark_cursor()
+        elif foreground_root() != self.hwnd:
             activate_window(self.hwnd)
-            if window_at(x, y) != self.hwnd:
-                raise RuntimeError("대상 창의 클릭 위치가 다른 창에 가려져 있습니다. 창 배치나 클릭 위치를 바꿔 주세요.")
-        click_at(x, y)
         time.sleep(0.15)
         if foreground_root() != self.hwnd:
-            raise RuntimeError("대상 창을 클릭했지만 활성화되지 않았습니다.")
+            raise RuntimeError("대상 앱이 활성화되지 않았습니다.")
 
     def focus_self(self):
-        """이 앱(캡처 패널)으로 돌아와 활성화"""
+        """이 앱(캡처 패널)으로 돌아와 활성화 → 이 상태에서 캡처"""
         if not self.click_mode:
             return
         r = wt.RECT()
         user32.GetWindowRect(self.panel_hwnd, ctypes.byref(r))
         click_at(r.left + (r.right - r.left) * 0.3, r.top + (r.bottom - r.top) * 0.62)
+        self.mark_cursor()
         time.sleep(0.12)
         if foreground_root() != self.panel_hwnd:
             raise RuntimeError("캡처 패널로 돌아오지 못했습니다.")
@@ -393,18 +478,19 @@ class CaptureJob(threading.Thread):
             if kind == "key":
                 press_key(code, mods)
             else:
-                mouse_wheel(code, click_point(self.hwnd, self.click_ratio))
+                mouse_wheel(code, self.point())
+                self.mark_cursor()
             time.sleep(0.04)
 
     def run(self):
         reason = "완료"
         try:
             esc_pressed()  # 이전 키 상태 비우기
+            self.mark_cursor()
             for left in range(int(self.cfg["start_delay"]), 0, -1):
                 self.emit("status", text=f"{left}초 후 시작 · 마우스를 건드리지 마세요")
-                if self.wait(1):
-                    raise InterruptedError
-            if not window_exists(self.hwnd):
+                self.wait(1)
+            if self.window_mode and not window_exists(self.hwnd):
                 raise RuntimeError("대상 창이 닫혔습니다.")
 
             self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -412,13 +498,11 @@ class CaptureJob(threading.Thread):
             max_pages = self.cfg["max_pages"]
             prev = None
 
-            # 시작 위치 이동
             self.focus_target()
             top = START_OPTIONS[self.cfg["start"]]
             if top:
                 press_key(*top)
-                if self.wait(self.cfg["page_delay"]):
-                    raise InterruptedError
+                self.wait(self.cfg["page_delay"])
 
             while True:
                 self.check_stop()
@@ -428,7 +512,8 @@ class CaptureJob(threading.Thread):
                 # 이 앱으로 돌아와서 캡처
                 self.focus_self()
                 time.sleep(0.1)  # 포커스가 빠진 대상 창이 다시 그려질 시간
-                img = self.grab_without_panel(capture_bbox(self.hwnd, self.cfg["area"]))
+                self.check_stop()
+                img = self.grab_without_panel(self.capture_bbox())
 
                 if self.cfg["detect_end"] and images_same(img, prev):
                     reason = "끝 도달(화면 변화 없음)"
@@ -444,32 +529,38 @@ class CaptureJob(threading.Thread):
                     reason = "최대 장수 도달"
                     break
 
-                # 대상 창을 선택하고 페이지 이동
+                # 대상 앱을 선택하고 페이지 이동
                 self.check_stop()
                 self.focus_target()
                 self.scroll()
-                if self.wait(self.cfg["page_delay"]):
-                    raise InterruptedError
-
-            if self.cfg["make_pdf"] and self.saved:
-                self.emit("status", text="PDF로 합치는 중…")
-                pages = [Image.open(p).convert("RGB") for p in self.saved]
-                pdf_path = self.out_dir / f"{self.out_dir.name}.pdf"
-                pages[0].save(pdf_path, save_all=True, append_images=pages[1:], resolution=96)
-        except InterruptedError:
-            reason = "사용자 중지"
+                self.wait(self.cfg["page_delay"])
+        except Stopped:
+            reason = self.stop_reason
         except Exception as e:  # noqa: BLE001
             reason = f"오류: {e}"
+
+        if self.cfg["make_pdf"] and self.saved:
+            try:
+                self.emit("status", text="PDF로 합치는 중…")
+                pages = [Image.open(p).convert("RGB") for p in self.saved]
+                pages[0].save(self.out_dir / f"{self.out_dir.name}.pdf", save_all=True,
+                              append_images=pages[1:], resolution=96)
+            except Exception as e:  # noqa: BLE001
+                reason += f" / PDF 실패: {e}"
         self.emit("done", reason=reason, count=len(self.saved), folder=str(self.out_dir))
 
 
 # ──────────────────────────────────────────────────────────────
-# GUI
+# 설정
 # ──────────────────────────────────────────────────────────────
 SETTINGS_FILE = Path.home() / ".auto_screenshot.json"
+SETTINGS_VERSION = 2
 DEFAULTS = {
+    "version": SETTINGS_VERSION,
+    "target": TARGET_SCREEN,
+    "click_abs": None,          # None = 화면 가운데
     "mode": MODE_CLICK,
-    "area": AREA_WINDOW,
+    "area": AREA_SCREEN,
     "start": "현재 위치에서 시작",
     "scroll": "Page Down",
     "repeat": 1,
@@ -481,16 +572,23 @@ DEFAULTS = {
     "make_pdf": False,
     "base_dir": str(Path.home() / "Pictures" / "AutoScreenshot"),
 }
+CHOICES = {"target": TARGETS, "mode": MODES, "area": AREAS,
+           "start": list(START_OPTIONS), "scroll": list(SCROLL_OPTIONS), "format": ["png", "jpg"]}
 
-PANEL_W, PANEL_H = 340, 92
+PANEL_W, PANEL_H = 360, 92
 
 
 def load_settings():
     data = dict(DEFAULTS)
     try:
-        data.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
+        saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        if saved.get("version") == SETTINGS_VERSION:  # 예전 버전 설정은 무시하고 새 기본값 사용
+            data.update(saved)
     except Exception:
         pass
+    for k, values in CHOICES.items():
+        if data.get(k) not in values:
+            data[k] = DEFAULTS[k]
     return data
 
 
@@ -501,23 +599,30 @@ def save_settings(data):
         pass
 
 
-def panel_position(target_hwnd, ratio):
-    """캡처 패널 위치: 대상 창과 겹치지 않는 모니터 모서리 (안 되면 클릭 위치만 피함)"""
-    l, t, r, b = monitor_work_rect(target_hwnd)
+def panel_position(click_xy, avoid_rect=None):
+    """캡처 패널 위치: 클릭 위치가 있는 모니터의 모서리 중 클릭 위치(와 대상 창)를 가리지 않는 곳"""
+    cx, cy = click_xy
+    l, t, r, b = monitor_at(cx, cy, work=True)
     m = 12
     cands = [(r - PANEL_W - m, b - PANEL_H - m), (l + m, b - PANEL_H - m),
              (r - PANEL_W - m, t + m), (l + m, t + m)]
-    target = window_rect(target_hwnd)
+
+    def covers_click(x, y):
+        return point_in((x - 30, y - 50, x + PANEL_W + 30, y + PANEL_H + 30), cx, cy)
+
+    if avoid_rect:
+        for x, y in cands:
+            if not rects_overlap((x, y, x + PANEL_W, y + PANEL_H), avoid_rect) and not covers_click(x, y):
+                return x, y
     for x, y in cands:
-        if not rects_overlap((x, y, x + PANEL_W, y + PANEL_H), target):
-            return x, y
-    cx, cy = click_point(target_hwnd, ratio)
-    for x, y in cands:
-        if not point_in((x - 20, y - 40, x + PANEL_W + 20, y + PANEL_H + 20), cx, cy):
+        if not covers_click(x, y):
             return x, y
     return cands[0]
 
 
+# ──────────────────────────────────────────────────────────────
+# GUI
+# ──────────────────────────────────────────────────────────────
 class App:
     def __init__(self, root):
         self.root = root
@@ -526,54 +631,28 @@ class App:
         self.panel = None
         self.windows = []
         self.last_folder = None
-        self.click_ratio = None
+        self.click_ratio = None       # 창 선택 모드의 클릭 위치 (창 기준 비율)
         self.click_ratio_hwnd = None
         s = load_settings()
+        self.click_abs = tuple(s["click_abs"]) if s["click_abs"] else None  # 화면 모드 클릭 위치
 
-        root.title(f"Auto Screenshot {APP_VERSION} - 자동 페이지 캡처")
-        # DPI 배율(125%, 150% …)에 맞춰 창 크기 조정
-        sc = max(1.0, root.winfo_fpixels("1i") / 96)
-        w, h = int(800 * sc), int(720 * sc)
-        h = min(h, root.winfo_screenheight() - int(80 * sc))
-        root.geometry(f"{w}x{h}")
-        root.minsize(int(720 * sc), min(int(640 * sc), h))
+        self.sc = sc = max(1.0, root.winfo_fpixels("1i") / 96)
+        root.title(f"Auto Screenshot {APP_VERSION}")
+        root.minsize(int(640 * sc), 1)
+        root.resizable(True, False)
 
         style = ttk.Style()
         try:
             style.theme_use("vista")
         except tk.TclError:
             pass
-        style.configure("Big.TButton", font=("맑은 고딕", 11, "bold"), padding=8)
+        style.configure("Big.TButton", font=("맑은 고딕", 13, "bold"), padding=(18, 12))
+        style.configure("Title.TLabel", font=("맑은 고딕", 15, "bold"))
         style.configure("Treeview", rowheight=int(22 * sc))
 
-        main = ttk.Frame(root, padding=12)
-        main.pack(fill="both", expand=True)
-
-        # 1. 대상 창 선택
-        f1 = ttk.LabelFrame(main, text=" ① 캡처할 창 선택 ", padding=8)
-        f1.pack(fill="both", expand=True)
-        top = ttk.Frame(f1)
-        top.pack(fill="x")
-        ttk.Label(top, text="스크린샷은 여기서 선택한 창에 대해서만 실행됩니다.").pack(side="left")
-        ttk.Button(top, text="🔄 목록 새로고침", command=self.refresh_windows).pack(side="right")
-
-        tree_wrap = ttk.Frame(f1)
-        tree_wrap.pack(fill="both", expand=True, pady=(6, 0))
-        self.tree = ttk.Treeview(tree_wrap, columns=("title", "proc"), show="headings", height=7, selectmode="browse")
-        self.tree.heading("title", text="창 제목")
-        self.tree.heading("proc", text="프로그램")
-        self.tree.column("title", width=520)
-        self.tree.column("proc", width=160)
-        sb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.tree.bind("<<TreeviewSelect>>", self.on_select)
-
-        # 2. 캡처 설정
-        f2 = ttk.LabelFrame(main, text=" ② 캡처 설정 ", padding=8)
-        f2.pack(fill="x", pady=(10, 0))
-        self.v_mode = tk.StringVar(value=s["mode"] if s["mode"] in MODES else MODE_CLICK)
+        # 변수
+        self.v_target = tk.StringVar(value=s["target"])
+        self.v_mode = tk.StringVar(value=s["mode"])
         self.v_area = tk.StringVar(value=s["area"])
         self.v_start = tk.StringVar(value=s["start"])
         self.v_scroll = tk.StringVar(value=s["scroll"])
@@ -584,126 +663,213 @@ class App:
         self.v_detect = tk.BooleanVar(value=s["detect_end"])
         self.v_format = tk.StringVar(value=s["format"])
         self.v_pdf = tk.BooleanVar(value=s["make_pdf"])
-        self.v_click = tk.StringVar(value="창 중앙 (기본)")
-
-        def row(r, c, label, widget):
-            ttk.Label(f2, text=label).grid(row=r, column=c, sticky="w", padx=(0, 6), pady=3)
-            widget.grid(row=r, column=c + 1, sticky="we", padx=(0, 16), pady=3)
-
-        row(0, 0, "동작 방식", ttk.Combobox(f2, textvariable=self.v_mode, values=MODES, state="readonly", width=26))
-        click_box = ttk.Frame(f2)
-        ttk.Label(click_box, textvariable=self.v_click, width=15).pack(side="left")
-        ttk.Button(click_box, text="📍 지정", width=7, command=self.pick_click_point).pack(side="left", padx=(4, 0))
-        ttk.Button(click_box, text="기본", width=5, command=self.reset_click_point).pack(side="left", padx=(4, 0))
-        row(0, 2, "클릭 위치", click_box)
-        row(1, 0, "캡처 영역", ttk.Combobox(f2, textvariable=self.v_area, values=AREAS, state="readonly", width=26))
-        row(1, 2, "시작 위치", ttk.Combobox(f2, textvariable=self.v_start, values=list(START_OPTIONS), state="readonly", width=28))
-        row(2, 0, "페이지 이동 방식", ttk.Combobox(f2, textvariable=self.v_scroll, values=list(SCROLL_OPTIONS), state="readonly", width=26))
-        row(2, 2, "1회 이동 시 반복 횟수", ttk.Spinbox(f2, from_=1, to=50, textvariable=self.v_repeat, width=8))
-        row(3, 0, "최대 캡처 장수", ttk.Spinbox(f2, from_=1, to=2000, textvariable=self.v_max, width=8))
-        row(3, 2, "페이지 간 대기(초)", ttk.Spinbox(f2, from_=0.1, to=10, increment=0.1, textvariable=self.v_delay, width=8))
-        row(4, 0, "시작 전 대기(초)", ttk.Spinbox(f2, from_=0, to=30, textvariable=self.v_start_delay, width=8))
-        row(4, 2, "이미지 형식", ttk.Combobox(f2, textvariable=self.v_format, values=["png", "jpg"], state="readonly", width=8))
-        chk = ttk.Frame(f2)
-        chk.grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
-        ttk.Checkbutton(chk, text="화면 변화가 없으면 끝으로 보고 자동 정지", variable=self.v_detect).pack(side="left", padx=(0, 14))
-        ttk.Checkbutton(chk, text="PDF로도 합치기", variable=self.v_pdf).pack(side="left")
-        ttk.Label(f2, foreground="#666", wraplength=int(740 * sc), justify="left",
-                  text="클릭 전환 모드: 마우스가 대상 창을 클릭해 페이지를 넘기고, 다시 이 앱의 캡처 패널을 클릭한 뒤 캡처합니다. "
-                       "대상 창이 비활성 상태에서 찍히므로 글자 커서·마우스 포인터가 이미지에 남지 않습니다. "
-                       "클릭 위치는 링크·버튼이 없는 빈 곳으로 지정하세요.").grid(row=6, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        f2.columnconfigure(1, weight=1)
-        f2.columnconfigure(3, weight=1)
-
-        # 3. 저장 위치
-        f3 = ttk.LabelFrame(main, text=" ③ 저장 위치 ", padding=8)
-        f3.pack(fill="x", pady=(10, 0))
         self.v_base = tk.StringVar(value=s["base_dir"])
-        self.v_prefix = tk.StringVar(value="")
-        ttk.Label(f3, text="상위 폴더").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
-        ttk.Entry(f3, textvariable=self.v_base).grid(row=0, column=1, sticky="we", pady=3)
-        ttk.Button(f3, text="찾아보기…", command=self.pick_folder).grid(row=0, column=2, padx=(6, 0))
-        ttk.Label(f3, text="폴더 이름").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=3)
-        ttk.Entry(f3, textvariable=self.v_prefix).grid(row=1, column=1, sticky="we", pady=3)
-        ttk.Label(f3, text="_날짜_시간 자동 추가", foreground="#666").grid(row=1, column=2, padx=(6, 0), sticky="w")
-        f3.columnconfigure(1, weight=1)
+        self.v_click = tk.StringVar()
+        self.v_summary = tk.StringVar()
+        self.v_status = tk.StringVar(value="캡처할 화면(원격 데스크톱·터미널·문서)을 띄워 두고 [캡처 시작]을 누르세요.")
 
-        # 4. 실행
-        f4 = ttk.Frame(main)
-        f4.pack(fill="x", pady=(12, 0))
-        self.btn_start = ttk.Button(f4, text="▶ 캡처 시작", style="Big.TButton", command=self.start)
+        main = ttk.Frame(root, padding=14)
+        main.pack(fill="both", expand=True)
+
+        # ── 기본 화면 ──
+        ttk.Label(main, text="📸 Auto Screenshot", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(main, textvariable=self.v_summary, foreground="#444", wraplength=int(600 * sc),
+                  justify="left").pack(anchor="w", pady=(4, 10))
+
+        row = ttk.Frame(main)
+        row.pack(fill="x")
+        self.btn_start = ttk.Button(row, text="▶ 캡처 시작", style="Big.TButton", command=self.start)
         self.btn_start.pack(side="left")
-        self.btn_open = ttk.Button(f4, text="📂 저장 폴더 열기", command=self.open_folder, state="disabled")
-        self.btn_open.pack(side="right")
+        ttk.Label(row, foreground="#666", justify="left",
+                  text="진행 중 중지: Esc 또는\n마우스를 직접 움직이기").pack(side="left", padx=14)
+
+        save = ttk.Frame(main)
+        save.pack(fill="x", pady=(12, 0))
+        ttk.Label(save, text="저장 폴더").pack(side="left")
+        ttk.Entry(save, textvariable=self.v_base).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(save, text="찾아보기…", command=self.pick_folder).pack(side="left")
+        self.btn_open = ttk.Button(save, text="📂 열기", command=self.open_folder)
+        self.btn_open.pack(side="left", padx=(6, 0))
 
         self.progress = ttk.Progressbar(main, mode="determinate")
-        self.progress.pack(fill="x", pady=(10, 4))
-        self.v_status = tk.StringVar(value="캡처할 창을 선택하세요.")
-        ttk.Label(main, textvariable=self.v_status, foreground="#0B5394").pack(anchor="w")
+        self.progress.pack(fill="x", pady=(12, 4))
+        ttk.Label(main, textvariable=self.v_status, foreground="#0B5394", wraplength=int(600 * sc),
+                  justify="left").pack(anchor="w")
+
+        self.btn_adv = ttk.Button(main, text="⚙ 설정 변경 ▸", command=self.toggle_advanced)
+        self.btn_adv.pack(anchor="w", pady=(10, 0))
+
+        # ── 상세 설정 (접힘) ──
+        self.adv = ttk.LabelFrame(main, text=" 상세 설정 — 필요할 때만 바꾸세요 ", padding=10)
+        a = self.adv
+
+        def grid_row(r, label, widget, col=0):
+            ttk.Label(a, text=label).grid(row=r, column=col, sticky="w", padx=(0, 6), pady=3)
+            widget.grid(row=r, column=col + 1, sticky="we", padx=(0, 14), pady=3)
+
+        grid_row(0, "캡처 대상", ttk.Combobox(a, textvariable=self.v_target, values=TARGETS, state="readonly", width=30))
+        click_box = ttk.Frame(a)
+        ttk.Label(click_box, textvariable=self.v_click, width=18).pack(side="left")
+        ttk.Button(click_box, text="📍 지정", width=7, command=self.pick_click_point).pack(side="left", padx=(4, 0))
+        ttk.Button(click_box, text="가운데", width=6, command=self.reset_click_point).pack(side="left", padx=(4, 0))
+        grid_row(0, "클릭 위치", click_box, col=2)
+
+        # 창 목록 (캡처 대상 = 목록에서 창 선택 일 때만 표시)
+        self.win_frame = ttk.Frame(a)
+        bar = ttk.Frame(self.win_frame)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="캡처할 창을 선택하세요.").pack(side="left")
+        ttk.Button(bar, text="🔄 새로고침", command=self.refresh_windows).pack(side="right")
+        tw = ttk.Frame(self.win_frame)
+        tw.pack(fill="both", expand=True, pady=(4, 0))
+        self.tree = ttk.Treeview(tw, columns=("title", "proc"), show="headings", height=6, selectmode="browse")
+        self.tree.heading("title", text="창 제목")
+        self.tree.heading("proc", text="프로그램")
+        self.tree.column("title", width=int(420 * sc))
+        self.tree.column("proc", width=int(140 * sc))
+        sb = ttk.Scrollbar(tw, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+
+        grid_row(2, "캡처 영역", ttk.Combobox(a, textvariable=self.v_area, values=AREAS, state="readonly", width=30))
+        grid_row(2, "페이지 이동", ttk.Combobox(a, textvariable=self.v_scroll, values=list(SCROLL_OPTIONS), state="readonly", width=28), col=2)
+        grid_row(3, "시작 위치", ttk.Combobox(a, textvariable=self.v_start, values=list(START_OPTIONS), state="readonly", width=30))
+        grid_row(3, "1회 이동 반복", ttk.Spinbox(a, from_=1, to=50, textvariable=self.v_repeat, width=8), col=2)
+        grid_row(4, "최대 캡처 장수", ttk.Spinbox(a, from_=1, to=2000, textvariable=self.v_max, width=8))
+        grid_row(4, "페이지 간 대기(초)", ttk.Spinbox(a, from_=0.1, to=10, increment=0.1, textvariable=self.v_delay, width=8), col=2)
+        grid_row(5, "시작 전 대기(초)", ttk.Spinbox(a, from_=0, to=30, textvariable=self.v_start_delay, width=8))
+        grid_row(5, "이미지 형식", ttk.Combobox(a, textvariable=self.v_format, values=["png", "jpg"], state="readonly", width=8), col=2)
+        grid_row(6, "동작 방식", ttk.Combobox(a, textvariable=self.v_mode, values=MODES, state="readonly", width=30))
+        chk = ttk.Frame(a)
+        chk.grid(row=7, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(chk, text="화면 변화가 없으면 끝으로 보고 자동 정지", variable=self.v_detect).pack(side="left", padx=(0, 14))
+        ttk.Checkbutton(chk, text="PDF로도 합치기", variable=self.v_pdf).pack(side="left")
+        ttk.Button(a, text="모든 설정 기본값으로", command=self.reset_all).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        a.columnconfigure(1, weight=1)
+        a.columnconfigure(3, weight=1)
+
+        for v in (self.v_target, self.v_mode, self.v_area, self.v_scroll, self.v_start,
+                  self.v_max, self.v_detect, self.v_pdf):
+            v.trace_add("write", lambda *_: self.update_summary())
+        self.v_target.trace_add("write", lambda *_: self.on_target_change())
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.refresh_windows()
+        self.on_target_change()
+        self.update_summary()
         self.root.after(50, self.poll_events)
 
-    # ── 창 선택 ──
+    # ── 표시 ──
+    def window_mode(self):
+        return self.v_target.get() == TARGET_WINDOW
+
+    def click_desc(self):
+        if self.window_mode():
+            if self.click_ratio and self.selected_window() and self.click_ratio_hwnd == self.selected_window()[0]:
+                fx, fy = self.click_ratio
+                return f"창 안 (가로 {fx:.0%}, 세로 {fy:.0%})"
+            return "창 가운데"
+        if self.click_abs:
+            return f"지정 위치 ({self.click_abs[0]}, {self.click_abs[1]})"
+        return "화면 가운데"
+
+    def update_summary(self):
+        self.v_click.set(self.click_desc())
+        try:
+            mx = int(self.v_max.get())
+        except (tk.TclError, ValueError):
+            mx = "?"
+        area = self.v_area.get()
+        who = "선택한 창" if self.window_mode() else self.click_desc()
+        scroll = self.v_scroll.get().split(" (")[0]
+        parts = [f"현재 설정: {area} 캡처", f"{who} 클릭 → {scroll}"]
+        if self.v_mode.get() == MODE_KEY:
+            parts[1] = f"{who}에 {scroll} (키 입력만)"
+        if self.v_detect.get():
+            parts.append("끝에서 자동 정지")
+        parts.append(f"최대 {mx}장")
+        if self.v_pdf.get():
+            parts.append("PDF 합치기")
+        self.v_summary.set(" · ".join(parts))
+
+    def toggle_advanced(self):
+        if self.adv.winfo_ismapped():
+            self.adv.pack_forget()
+            self.btn_adv.configure(text="⚙ 설정 변경 ▸")
+        else:
+            self.adv.pack(fill="x", pady=(8, 0))
+            self.btn_adv.configure(text="⚙ 설정 변경 ▾ (닫기)")
+        self.root.geometry("")  # 내용에 맞춰 창 높이 자동 조정
+
+    def on_target_change(self):
+        if self.window_mode():
+            self.win_frame.grid(row=1, column=0, columnspan=4, sticky="we", pady=(4, 8))
+            if not self.windows:
+                self.refresh_windows()
+            if self.v_area.get() == AREA_SCREEN:
+                self.v_area.set(AREA_WINDOW)
+        else:
+            self.win_frame.grid_remove()
+        self.update_summary()
+        self.root.geometry("")
+
+    # ── 창 선택 (상세 설정) ──
     def refresh_windows(self):
         self.windows = list_windows(exclude_pid=os.getpid())
         self.tree.delete(*self.tree.get_children())
         for hwnd, title, proc in self.windows:
             self.tree.insert("", "end", iid=str(hwnd), values=(title, proc))
-        self.v_status.set(f"창 {len(self.windows)}개를 찾았습니다. 캡처할 창을 선택하세요.")
 
     def selected_window(self):
         sel = self.tree.selection()
         if not sel:
             return None
         hwnd = int(sel[0])
-        for w in self.windows:
-            if w[0] == hwnd:
-                return w
-        return None
+        return next((w for w in self.windows if w[0] == hwnd), None)
 
     def on_select(self, _=None):
         w = self.selected_window()
         if w:
-            self.v_prefix.set(safe_name(w[1]))
-            self.v_status.set(f"선택됨: {w[1]}")
-            if self.click_ratio_hwnd != w[0]:
-                self.reset_click_point()
+            self.v_status.set(f"선택한 창: {w[1]}")
+        self.update_summary()
 
-    # ── 클릭 위치 지정 ──
+    # ── 클릭 위치 ──
     def reset_click_point(self):
+        self.click_abs = None
         self.click_ratio = None
         self.click_ratio_hwnd = None
-        self.v_click.set("창 중앙 (기본)")
+        self.update_summary()
 
     def pick_click_point(self):
-        w = self.selected_window()
-        if not w:
-            messagebox.showwarning("창 선택", "먼저 캡처할 창을 목록에서 선택하세요.")
-            return
-        if not window_exists(w[0]):
-            messagebox.showwarning("창 없음", "선택한 창이 닫혔습니다. 목록을 새로고침하세요.")
-            return
-        activate_window(w[0])
-        self.root.iconify()
+        hwnd = None
+        if self.window_mode():
+            w = self.selected_window()
+            if not w or not window_exists(w[0]):
+                messagebox.showwarning("창 선택", "먼저 목록에서 캡처할 창을 선택하세요.")
+                return
+            hwnd = w[0]
+            activate_window(hwnd)
+        self.root.withdraw()
         user32.GetAsyncKeyState(VK_LBUTTON)  # 이전 상태 비우기
-        self.v_status.set("대상 창에서 클릭할 위치를 마우스로 한 번 클릭하세요 (10초)")
-        self.root.after(30, self._poll_pick, w[0], False, time.time() + 10)
+        self.root.after(30, self._poll_pick, hwnd, False, time.time() + 15)
 
     def _poll_pick(self, hwnd, was_down, deadline):
         down = bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
         if was_down and not down:
             x, y = cursor_pos()
-            if window_at(x, y) == hwnd:
+            if hwnd is None:
+                self.click_abs = (x, y)
+                self.v_status.set(f"클릭 위치를 ({x}, {y})로 지정했습니다.")
+            elif window_at(x, y) == hwnd:
                 l, t, r, b = window_rect(hwnd)
-                fx = min(max((x - l) / max(1, r - l), 0.0), 1.0)
-                fy = min(max((y - t) / max(1, b - t), 0.0), 1.0)
-                self.click_ratio, self.click_ratio_hwnd = (fx, fy), hwnd
-                self.v_click.set(f"가로 {fx:.0%} · 세로 {fy:.0%}")
-                self.v_status.set("클릭 위치를 지정했습니다.")
+                self.click_ratio = (min(max((x - l) / max(1, r - l), 0.0), 1.0),
+                                    min(max((y - t) / max(1, b - t), 0.0), 1.0))
+                self.click_ratio_hwnd = hwnd
+                self.v_status.set("창 안의 클릭 위치를 지정했습니다.")
             else:
                 self.v_status.set("선택한 창 밖을 클릭했습니다. 다시 지정하세요.")
+            self.update_summary()
             self.root.deiconify()
             return
         if time.time() > deadline:
@@ -712,13 +878,33 @@ class App:
             return
         self.root.after(30, self._poll_pick, hwnd, down, deadline)
 
+    # ── 기타 ──
     def pick_folder(self):
         d = filedialog.askdirectory(initialdir=self.v_base.get() or str(Path.home()))
         if d:
             self.v_base.set(d)
 
+    def open_folder(self):
+        target = self.last_folder if self.last_folder and self.last_folder.exists() else Path(self.v_base.get())
+        if target.exists():
+            os.startfile(target)
+        else:
+            messagebox.showinfo("저장 폴더", "아직 저장된 캡처가 없습니다.")
+
+    def reset_all(self):
+        d = DEFAULTS
+        self.v_target.set(d["target"]); self.v_mode.set(d["mode"]); self.v_area.set(d["area"])
+        self.v_start.set(d["start"]); self.v_scroll.set(d["scroll"]); self.v_repeat.set(d["repeat"])
+        self.v_max.set(d["max_pages"]); self.v_delay.set(d["page_delay"]); self.v_start_delay.set(d["start_delay"])
+        self.v_detect.set(d["detect_end"]); self.v_format.set(d["format"]); self.v_pdf.set(d["make_pdf"])
+        self.reset_click_point()
+        self.v_status.set("모든 설정을 기본값으로 되돌렸습니다.")
+
     def collect_config(self):
         cfg = {
+            "version": SETTINGS_VERSION,
+            "target": self.v_target.get(),
+            "click_abs": list(self.click_abs) if self.click_abs else None,
             "mode": self.v_mode.get(),
             "area": self.v_area.get(),
             "start": self.v_start.get(),
@@ -732,14 +918,13 @@ class App:
             "make_pdf": self.v_pdf.get(),
             "base_dir": self.v_base.get().strip(),
         }
-        if cfg["area"] not in AREAS:
-            cfg["area"] = AREA_WINDOW
-        if cfg["mode"] not in MODES:
-            cfg["mode"] = MODE_CLICK
+        for k, values in CHOICES.items():
+            if cfg[k] not in values:
+                cfg[k] = DEFAULTS[k]
         return cfg
 
     # ── 캡처 패널 (캡처 중 표시되는 작은 창 = 마우스가 돌아오는 '이 앱') ──
-    def make_panel(self, target_hwnd):
+    def make_panel(self, click_xy, avoid_rect):
         p = tk.Toplevel(self.root)
         p.title("Auto Screenshot")
         p.resizable(False, False)
@@ -753,7 +938,7 @@ class App:
         self.v_panel = tk.StringVar(value="준비 중…")
         tk.Label(frame, textvariable=self.v_panel, bg="#0B5394", fg="white", justify="left", anchor="w",
                  font=("맑은 고딕", 10, "bold")).pack(side="left", fill="both", expand=True, padx=(12, 0))
-        x, y = panel_position(target_hwnd, self.click_ratio)
+        x, y = panel_position(click_xy, avoid_rect)
         p.geometry(f"{PANEL_W}x{PANEL_H}+{x}+{y}")
         p.protocol("WM_DELETE_WINDOW", self.stop)
         p.update()
@@ -761,50 +946,51 @@ class App:
         return int(p.wm_frame(), 16)
 
     def start(self):
-        w = self.selected_window()
-        if not w:
-            messagebox.showwarning("창 선택", "먼저 캡처할 창을 목록에서 선택하세요.")
-            return
-        if not window_exists(w[0]):
-            messagebox.showwarning("창 없음", "선택한 창이 닫혔습니다. 목록을 새로고침하세요.")
-            self.refresh_windows()
-            return
         try:
             cfg = self.collect_config()
         except (ValueError, tk.TclError):
-            messagebox.showerror("설정 오류", "숫자 입력값을 확인하세요.")
+            messagebox.showerror("설정 오류", "상세 설정의 숫자 입력값을 확인하세요.")
             return
         if not cfg["base_dir"]:
-            messagebox.showwarning("저장 위치", "상위 폴더를 지정하세요.")
+            messagebox.showwarning("저장 폴더", "저장 폴더를 지정하세요.")
             return
+
+        target_hwnd, ratio = None, None
+        if cfg["target"] == TARGET_WINDOW:
+            w = self.selected_window()
+            if not w or not window_exists(w[0]):
+                messagebox.showwarning("창 선택", "[⚙ 설정 변경]의 목록에서 캡처할 창을 선택하세요.\n"
+                                                 "(또는 캡처 대상을 '화면 가운데 앱'으로 바꾸세요)")
+                self.refresh_windows()
+                return
+            target_hwnd = w[0]
+            ratio = self.click_ratio if self.click_ratio_hwnd == target_hwnd else None
+            folder = safe_name(w[1])
+        else:
+            folder = "Screenshot"
         save_settings(cfg)
 
-        folder = f"{safe_name(self.v_prefix.get() or w[1])}_{datetime.now():%Y%m%d_%H%M%S}"
-        out_dir = Path(cfg["base_dir"]) / folder
+        out_dir = Path(cfg["base_dir"]) / f"{folder}_{datetime.now():%Y%m%d_%H%M%S}"
         self.last_folder = out_dir
-
         self.progress.configure(maximum=cfg["max_pages"], value=0)
         self.btn_start.configure(state="disabled")
-        self.btn_open.configure(state="disabled")
 
         # 메인 창은 숨기고, 작은 캡처 패널만 띄운다
         self.root.withdraw()
-        if user32.IsIconic(w[0]):
-            user32.ShowWindow(w[0], SW_RESTORE)
-        activate_window(w[0])
-        panel_hwnd = self.make_panel(w[0])
+        if target_hwnd:
+            activate_window(target_hwnd)
+            click_xy, avoid = click_point(target_hwnd, ratio), window_rect(target_hwnd)
+        else:
+            click_xy, avoid = (self.click_abs or primary_center()), None
+        panel_hwnd = self.make_panel(click_xy, avoid)
 
-        ratio = self.click_ratio if self.click_ratio_hwnd == w[0] else None
-        self.job = CaptureJob(w[0], cfg, out_dir, self.events, panel_hwnd, ratio)
+        self.job = CaptureJob(cfg, out_dir, self.events, panel_hwnd,
+                              target_hwnd=target_hwnd, click_ratio=ratio, click_abs=self.click_abs)
         self.job.start()
 
     def stop(self):
         if self.job:
             self.job.stop_flag.set()
-
-    def open_folder(self):
-        if self.last_folder and self.last_folder.exists():
-            os.startfile(self.last_folder)
 
     def poll_events(self):
         try:
@@ -813,12 +999,14 @@ class App:
                 if kind == "status":
                     self.v_status.set(data["text"])
                     if self.panel:
-                        self.v_panel.set(f"📸 {data['text']}\nEsc: 중지")
+                        self.v_panel.set(f"📸 {data['text']}\nEsc 또는 마우스를 움직이면 중지")
+                elif kind == "target":
+                    self.v_status.set(f"대상 앱: {data['title']}")
                 elif kind == "progress":
                     self.progress.configure(value=data["count"])
                     self.v_status.set(f"{data['count']}장 저장됨 → {os.path.basename(data['path'])}")
                     if self.panel:
-                        self.v_panel.set(f"📸 캡처 중 · {data['count']}장 저장\n마우스를 건드리지 마세요 · Esc: 중지")
+                        self.v_panel.set(f"📸 캡처 중 · {data['count']}장 저장\nEsc 또는 마우스를 움직이면 중지")
                 elif kind == "done":
                     self.finish(data)
         except queue.Empty:
@@ -837,7 +1025,6 @@ class App:
         self.root.after(300, lambda: self.root.attributes("-topmost", False))
         count, reason = data["count"], data["reason"]
         if count:
-            self.btn_open.configure(state="normal")
             self.v_status.set(f"✅ {count}장 저장 완료 [{reason}] → {data['folder']}")
         else:
             self.v_status.set(f"저장된 이미지 없음 [{reason}]")
