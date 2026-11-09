@@ -2,7 +2,7 @@
 
 선택한 창(터미널, 메모장, PDF 뷰어, 브라우저 등)을 **페이지 단위로 넘기면서 자동으로 스크린샷을 찍어** 새 폴더에 번호 순서대로 저장하는 Windows 앱입니다.
 
-- 소개·다운로드 페이지: https://auto-screenshot.vercel.app
+- 소개·다운로드 페이지: https://auto-screenshot-six.vercel.app
 - 실행 파일: [Releases](../../releases/latest) 에서 `AutoScreenshot.exe` 다운로드
 
 ## 동작 방식 — 마우스 클릭 전환 (기본)
